@@ -93,8 +93,18 @@ int wifi_change_driver_state(const char *state) {
   int len;
   int fd;
   int ret = 0;
+  int count = 5; /* wait at most 1 second for completion. */
 
   if (!state) return -1;
+  do {
+    if (access(WIFI_DRIVER_STATE_CTRL_PARAM, R_OK|W_OK) == 0)
+      break;
+      usleep(200000);
+  } while (--count > 0);
+  if (count == 0) {
+    PLOG(ERROR) << "Failed to access driver state control param " << strerror(errno) << ", " << errno;
+    return -1;
+  }
   fd = TEMP_FAILURE_RETRY(open(WIFI_DRIVER_STATE_CTRL_PARAM, O_WRONLY));
   if (fd < 0) {
     PLOG(ERROR) << "Failed to open driver state control param";
@@ -161,7 +171,19 @@ int wifi_load_driver() {
     return 0;
   }
 
-  if (wifi_change_driver_state(WIFI_DRIVER_STATE_ON) < 0) return -1;
+  if (wifi_change_driver_state(WIFI_DRIVER_STATE_ON) < 0) {
+#ifdef WIFI_DRIVER_MODULE_PATH
+    PLOG(WARNING) << "Driver unloading, err='fail to change driver state'";
+    if (rmmod(DRIVER_MODULE_NAME) == 0) {
+      PLOG(DEBUG) << "Driver unloaded";
+    } else {
+      // Set driver prop to "ok", expect HL to restart Wi-Fi.
+      PLOG(DEBUG) << "Driver unload failed! set driver prop to 'ok'.";
+      property_set(DRIVER_PROP_NAME, "ok");
+    }
+#endif
+    return -1;
+  }
 #endif
   property_set(DRIVER_PROP_NAME, "ok");
   return 0;

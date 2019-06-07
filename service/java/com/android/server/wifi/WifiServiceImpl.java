@@ -58,6 +58,8 @@ import android.net.Network;
 import android.net.NetworkUtils;
 import android.net.Uri;
 import android.net.ip.IpClient;
+import android.net.StaticIpConfiguration;
+import android.net.IpConfiguration;
 import android.net.wifi.ISoftApCallback;
 import android.net.wifi.IWifiManager;
 import android.net.wifi.ScanResult;
@@ -70,6 +72,8 @@ import android.net.wifi.WifiSsid;
 import android.net.wifi.hotspot2.IProvisioningCallback;
 import android.net.wifi.hotspot2.OsuProvider;
 import android.net.wifi.hotspot2.PasspointConfiguration;
+import android.net.wifi.WifiDppConfig;
+import android.net.wifi.SupplicantState;
 import android.os.AsyncTask;
 import android.os.BatteryStats;
 import android.os.Binder;
@@ -88,6 +92,7 @@ import android.os.ShellCallback;
 import android.os.UserHandle;
 import android.os.UserManager;
 import android.os.WorkSource;
+import android.os.SystemProperties;
 import android.provider.Settings;
 import android.telephony.TelephonyManager;
 import android.util.Log;
@@ -105,6 +110,7 @@ import com.android.server.wifi.hotspot2.PasspointProvider;
 import com.android.server.wifi.util.GeneralUtil.Mutable;
 import com.android.server.wifi.util.WifiHandler;
 import com.android.server.wifi.util.WifiPermissionsUtil;
+import com.android.server.wifi.util.ApConfigUtil;
 
 import java.io.BufferedReader;
 import java.io.FileDescriptor;
@@ -220,6 +226,10 @@ public class WifiServiceImpl extends IWifiManager.Stub {
     private int mWifiApState = WifiManager.WIFI_AP_STATE_DISABLED;
     private int mSoftApState = WifiManager.WIFI_AP_STATE_DISABLED;
     private int mSoftApNumClients = 0;
+    private int mQCSoftApNumClients = 0;
+
+    // Store Previous AP band when current band is dual band
+    private int mPrevApBand = 0;
 
     /**
      * Power profile
@@ -444,6 +454,58 @@ public class WifiServiceImpl extends IWifiManager.Stub {
 
     private WifiApConfigStore mWifiApConfigStore;
 
+    private void restartSoftApIfNeeded() {
+        if (getWifiApEnabledState() == WifiManager.WIFI_AP_STATE_DISABLED) {
+            Slog.d(TAG ,"Repeater mode: not restarting SoftAP as Hotspot is disabled.");
+            return;
+        }
+
+        Slog.d(TAG ,"Repeater mode: Stop SoftAP.");
+        mRestartWifiApIfRequired = true;
+        stopSoftAp();
+
+        IntentFilter filter = new IntentFilter(WifiManager.WIFI_AP_STATE_CHANGED_ACTION);
+        Intent intent = mContext.registerReceiver(new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (action.equals(WifiManager.WIFI_AP_STATE_CHANGED_ACTION)) {
+                int state = intent.getIntExtra(WifiManager.EXTRA_WIFI_AP_STATE, 0);
+                if ((state == WifiManager.WIFI_AP_STATE_DISABLED) && mRestartWifiApIfRequired) {
+                    Slog.d(TAG ,"Repeater mode: Restart SoftAP.");
+                    mRestartWifiApIfRequired = false;
+                    mContext.unregisterReceiver(this);
+                    startSoftAp(null);
+                }
+            }
+        }
+        }, filter);
+    }
+
+    private boolean mRestartWifiApIfRequired = false;
+    private boolean mSoftApExtendingWifi = false;
+    private final IntentFilter mQcIntentFilter;
+    private final BroadcastReceiver mQcReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (WifiManager.SUPPLICANT_STATE_CHANGED_ACTION.equals(action)) {
+                SupplicantState state = (SupplicantState) intent.getParcelableExtra(WifiManager.EXTRA_NEW_STATE);
+                if (isCurrentStaShareThisAp() && state == SupplicantState.COMPLETED) {
+                    restartSoftApIfNeeded();
+                } else if (mSoftApExtendingWifi && state == SupplicantState.DISCONNECTED) {
+                    restartSoftApIfNeeded();
+                }
+            } else if (WifiManager.WIFI_STATE_CHANGED_ACTION.equals(action)) {
+                 int state = intent.getIntExtra(WifiManager.EXTRA_WIFI_STATE, WifiManager.WIFI_STATE_UNKNOWN);
+                 if (mSoftApExtendingWifi && state == WifiManager.WIFI_STATE_DISABLED) {
+                     restartSoftApIfNeeded();
+                 }
+            }
+        }
+    };
+
+
     public WifiServiceImpl(Context context, WifiInjector wifiInjector, AsyncChannel asyncChannel) {
         mContext = context;
         mWifiInjector = wifiInjector;
@@ -456,6 +518,7 @@ public class WifiServiceImpl extends IWifiManager.Stub {
         mCountryCode = mWifiInjector.getWifiCountryCode();
         mWifiStateMachine = mWifiInjector.getWifiStateMachine();
         mWifiStateMachinePrime = mWifiInjector.getWifiStateMachinePrime();
+        mWifiStateMachine.setTrafficPoller(mTrafficPoller);
         mWifiStateMachine.enableRssiPolling(true);
         mScanRequestProxy = mWifiInjector.getScanRequestProxy();
         mSettingsStore = mWifiInjector.getWifiSettingsStore();
@@ -484,6 +547,9 @@ public class WifiServiceImpl extends IWifiManager.Stub {
 
         mWifiInjector.getWifiStateMachinePrime().registerSoftApCallback(new SoftApCallbackImpl());
         mPowerProfile = mWifiInjector.getPowerProfile();
+        mQcIntentFilter = new IntentFilter("android.net.wifi.supplicant.STATE_CHANGE");
+        mQcIntentFilter.addAction("android.net.wifi.WIFI_STATE_CHANGED");
+        mContext.registerReceiver(mQcReceiver, mQcIntentFilter);
     }
 
     /**
@@ -901,6 +967,10 @@ public class WifiServiceImpl extends IWifiManager.Stub {
             }
         }
 
+        if (enable && mWifiApConfigStore.getDualSapStatus()
+              && (apEnabled || (mWifiApState == WifiManager.WIFI_AP_STATE_ENABLING)))
+            stopSoftAp();
+
         if (!mIsControllerStarted) {
             Slog.e(TAG,"WifiController is not yet started, abort setWifiEnabled");
             return false;
@@ -1065,6 +1135,14 @@ public class WifiServiceImpl extends IWifiManager.Stub {
         mLog.trace("startSoftApInternal uid=% mode=%")
                 .c(Binder.getCallingUid()).c(mode).flush();
 
+        wifiConfig = setDualSapMode(wifiConfig);
+
+        mSoftApExtendingWifi = isCurrentStaShareThisAp();
+        if (mSoftApExtendingWifi) {
+            startSoftApInRepeaterMode(mode, wifiConfig);
+            return true;
+        }
+
         // null wifiConfig is a meaningful input for CMD_SET_AP
         if (wifiConfig == null || WifiApConfigStore.validateApWifiConfiguration(wifiConfig)) {
             SoftApModeConfiguration softApConfig = new SoftApModeConfiguration(mode, wifiConfig);
@@ -1109,6 +1187,7 @@ public class WifiServiceImpl extends IWifiManager.Stub {
     private boolean stopSoftApInternal() {
         mLog.trace("stopSoftApInternal uid=%").c(Binder.getCallingUid()).flush();
 
+        mSoftApExtendingWifi = false;
         mWifiController.sendMessage(CMD_SET_AP, 0, 0);
         return true;
     }
@@ -1160,6 +1239,54 @@ public class WifiServiceImpl extends IWifiManager.Stub {
                     callback.onNumClientsChanged(numClients);
                 } catch (RemoteException e) {
                     Log.e(TAG, "onNumClientsChanged: remote exception -- " + e);
+                    iterator.remove();
+                }
+            }
+        }
+
+        /**
+         * Called when station connected to soft AP changes.
+         *
+         * @param Macaddr Mac Address of connected Stations to soft AP
+         * @param numClients number of connected clients to soft AP
+         */
+        @Override
+        public void onStaConnected(String Macaddr,int numClients) {
+            mQCSoftApNumClients = numClients;
+
+            Iterator<ISoftApCallback> iterator = mRegisteredSoftApCallbacks.values().iterator();
+            while (iterator.hasNext()) {
+                ISoftApCallback callback = iterator.next();
+                try {
+                    Log.d(TAG, "onStaConnected Macaddr: " + Macaddr +
+                          " with num of active client:" + mQCSoftApNumClients);
+                    callback.onStaConnected(Macaddr, mQCSoftApNumClients);
+                } catch (RemoteException e) {
+                    Log.e(TAG, "onStaConnected: remote exception -- " + e);
+                    iterator.remove();
+                }
+            }
+        }
+
+        /**
+         * Called when station disconnected to soft AP changes.
+         *
+         * @param Macaddr Mac Address of Disconnected Stations to soft AP
+         * @param numClients number of connected clients to soft AP
+         */
+        @Override
+        public void onStaDisconnected(String Macaddr, int numClients) {
+            mQCSoftApNumClients = numClients;
+
+            Iterator<ISoftApCallback> iterator = mRegisteredSoftApCallbacks.values().iterator();
+            while (iterator.hasNext()) {
+                ISoftApCallback callback = iterator.next();
+                try {
+                    Log.d(TAG, "onStaDisconnected Macaddr: " + Macaddr +
+                          " with num of active client:" + mQCSoftApNumClients);
+                    callback.onStaDisconnected(Macaddr, mQCSoftApNumClients);
+                } catch (RemoteException e) {
+                    Log.e(TAG, "onStaDisconnected: remote exception -- " + e);
                     iterator.remove();
                 }
             }
@@ -1225,6 +1352,7 @@ public class WifiServiceImpl extends IWifiManager.Stub {
             try {
                 callback.onStateChanged(mSoftApState, 0);
                 callback.onNumClientsChanged(mSoftApNumClients);
+                callback.onStaConnected("", mQCSoftApNumClients);
             } catch (RemoteException e) {
                 Log.e(TAG, "registerSoftApCallback: remote exception -- " + e);
             }
@@ -2204,6 +2332,10 @@ public class WifiServiceImpl extends IWifiManager.Stub {
         mWifiStateMachine.deauthenticateNetwork(mWifiStateMachineChannel, holdoff, ess);
     }
 
+    public String getCapabilities(String capaType) {
+        return mWifiStateMachine.getCapabilities(capaType);
+    }
+
     /**
      * Set the country code
      * @param countryCode ISO 3166 country code.
@@ -2901,5 +3033,224 @@ public class WifiServiceImpl extends IWifiManager.Stub {
             mLog.trace("Subscription provisioning started with %")
                     .c(provider.toString()).flush();
         }
+    }
+
+    /**
+     * Add the DPP bootstrap info obtained from QR code.
+     *
+     * @param uri:The URI obtained from the QR code reader.
+     *
+     * @return: Handle to strored info else -1 on failure
+     * @hide
+     */
+    @Override
+    public int dppAddBootstrapQrCode(String uri) {
+        return mWifiStateMachine.syncDppAddBootstrapQrCode(mWifiStateMachineChannel, uri);
+    }
+
+    /**
+     * Generate bootstrap URI based on the passed arguments
+     *
+     * @param config – bootstrap generate config
+     *
+     * @return: Handle to strored URI info else -1 on failure
+     */
+    @Override
+    public int dppBootstrapGenerate(WifiDppConfig config) {
+        return mWifiStateMachine.syncDppBootstrapGenerate(mWifiStateMachineChannel, config);
+    }
+
+    /**
+     * Get bootstrap URI based on bootstrap ID
+     *
+     * @param bootstrap_id: Stored bootstrap ID
+     *
+     * @return: URI string else -1 on failure
+     */
+    @Override
+    public String dppGetUri(int bootstrap_id) {
+        return mWifiStateMachine.syncDppGetUri(mWifiStateMachineChannel, bootstrap_id);
+    }
+
+    /**
+     * Remove bootstrap URI based on bootstrap ID.
+     *
+     * @param bootstrap_id: Stored bootstrap ID
+     *
+     * @return: 0 – Success or -1 on failure
+     */
+    @Override
+    public int dppBootstrapRemove(int bootstrap_id) {
+        return mWifiStateMachine.syncDppBootstrapRemove(mWifiStateMachineChannel, bootstrap_id);
+    }
+
+    /**
+     * start listen on the channel specified waiting to receive
+     * the DPP Authentication request.
+     *
+     * @param frequency: DPP listen frequency
+     * @param dpp_role: Configurator/Enrollee role
+     * @param qr_mutual: Mutual authentication required
+     * @param netrole_ap: network role
+     *
+     * @return: Returns 0 if a DPP-listen work is successfully
+     *  queued and -1 on failure.
+     */
+    @Override
+    public int dppListen(String frequency, int dpp_role, boolean qr_mutual, boolean netrole_ap) {
+        return mWifiStateMachine.syncDppListen(mWifiStateMachineChannel, frequency, dpp_role,
+                                               qr_mutual, netrole_ap);
+    }
+
+    /**
+     * stop ongoing dpp listen
+     */
+    @Override
+    public void dppStopListen() {
+        mWifiStateMachine.dppStopListen(mWifiStateMachineChannel);
+    }
+
+    /**
+     * Adds the DPP configurator
+     *
+     * @param curve curve used for dpp encryption
+     * @param key private key
+     * @param expiry timeout in seconds
+     *
+     * @return: Identifier of the added configurator or -1 on failure
+     */
+    @Override
+    public int dppConfiguratorAdd(String curve, String key, int expiry) {
+        return mWifiStateMachine.syncDppConfiguratorAdd(
+            mWifiStateMachineChannel, curve, key, expiry);
+    }
+
+    /**
+     * Remove the added configurator through dppConfiguratorAdd.
+     *
+     * @param config_id: DPP Configurator ID
+     *
+     * @return: Handle to strored info else -1 on failure
+     */
+    @Override
+    public int dppConfiguratorRemove(int config_id) {
+        return mWifiStateMachine.syncDppConfiguratorRemove(mWifiStateMachineChannel, config_id);
+    }
+
+    /**
+     * Start DPP authentication and provisioning with the specified peer
+     *
+     * @param config – dpp auth init config
+     *
+     * @return: 0 if DPP Authentication request was transmitted and -1 on failure
+     */
+    @Override
+    public int  dppStartAuth(WifiDppConfig config) {
+        return mWifiStateMachine.syncDppStartAuth(mWifiStateMachineChannel, config);
+    }
+
+    /**
+     * Retrieve Private key to be used for configurator
+     *
+     * @param id: id of configurator object
+     *
+     * @return: KEY string else -1 on failure
+     */
+    public String dppConfiguratorGetKey(int id) {
+        return mWifiStateMachine.syncDppConfiguratorGetKey(mWifiStateMachineChannel, id);
+    }
+
+    /**
+     * Set Latency level
+     *
+     * @return 0 if request was success else -1 on failure.
+     */
+    @Override
+    public int setLatencyLevel(int level, String packageName) {
+        if (enforceChangePermission(packageName) != MODE_ALLOWED) {
+            return -1;
+        }
+        mLog.info("setLatencyLevel uid=% level=%")
+                .c(Binder.getCallingUid())
+                .c(level).flush();
+        return mWifiStateMachine.setLatencyLevel(level) ? 0 : -1;
+    }
+
+    private WifiConfiguration setDualSapMode(WifiConfiguration apConfig) {
+        WifiConfiguration newApConfig;
+        boolean bandUpdated = false;
+
+        if (apConfig == null)
+            newApConfig = new WifiConfiguration(mWifiApConfigStore.getApConfiguration());
+        else
+            newApConfig = new WifiConfiguration(apConfig);
+
+
+        // If dual sap property is set, force softap in dual sap.
+        if (SystemProperties.get("persist.vendor.wifi.softap.dualband", "0").equals("1")) {
+            newApConfig.apBand = WifiConfiguration.AP_BAND_DUAL;
+            bandUpdated = true;
+        }
+
+        if (newApConfig.apBand == WifiConfiguration.AP_BAND_DUAL) {
+            mLog.trace("setDualSapMode uid=%").c(Binder.getCallingUid()).flush();
+            mWifiApConfigStore.setDualSapStatus(true);
+        } else {
+            mWifiApConfigStore.setDualSapStatus(false);
+        }
+
+        return bandUpdated ? newApConfig : apConfig;
+    }
+
+    /* API to check whether SoftAp extending current sta connected AP network*/
+    public boolean isExtendingWifi() {
+        return mSoftApExtendingWifi;
+    }
+
+    public boolean isCurrentStaShareThisAp() {
+        WifiConfiguration currentStaConfig = mWifiStateMachine.getCurrentWifiConfiguration();
+
+        if (isWifiCoverageExtendFeatureEnabled()
+             && currentStaConfig != null
+             && !currentStaConfig.isEnterprise()
+             && currentStaConfig.shareThisAp) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private void startSoftApInRepeaterMode(int mode, WifiConfiguration apConfig) {
+        WifiInfo wifiInfo = mWifiStateMachine.getWifiInfo();
+        WifiConfigManager wifiConfigManager = mWifiInjector.getWifiConfigManager();
+        WifiConfiguration currentStaConfig = wifiConfigManager.getConfiguredNetworkWithPassword(wifiInfo.getNetworkId());
+        SoftApModeConfiguration softApConfig = new SoftApModeConfiguration(mode, currentStaConfig);
+
+        // Remove double quotes in SSID and psk
+        softApConfig.mConfig.SSID = WifiInfo.removeDoubleQuotes(softApConfig.mConfig.SSID);
+        softApConfig.mConfig.preSharedKey = WifiInfo.removeDoubleQuotes(softApConfig.mConfig.preSharedKey);
+
+        // Get band info from SoftAP configuration
+        if (apConfig == null)
+            softApConfig.mConfig.apBand = mWifiApConfigStore.getApConfiguration().apBand;
+        else
+            softApConfig.mConfig.apBand = apConfig.apBand;
+
+        Slog.d(TAG,"Repeater mode config - " + softApConfig.mConfig);
+        mWifiController.sendMessage(CMD_SET_AP, 1, 0, softApConfig);
+    }
+
+    public boolean isWifiCoverageExtendFeatureEnabled() {
+        enforceAccessPermission();
+        return mFacade.getIntegerSetting(mContext, Settings.Global.WIFI_COVERAGE_EXTEND_FEATURE_ENABLED, 0) > 0 ;
+    }
+
+    public void enableWifiCoverageExtendFeature(boolean enable) {
+        enforceAccessPermission();
+        enforceNetworkSettingsPermission();
+        mLog.info("enableWifiCoverageExtendFeature uid=% enable=%")
+                .c(Binder.getCallingUid())
+                .c(enable).flush();
+        mFacade.setIntegerSetting(mContext, Settings.Global.WIFI_COVERAGE_EXTEND_FEATURE_ENABLED, (enable ? 1 : 0));
     }
 }
